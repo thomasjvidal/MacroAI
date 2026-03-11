@@ -6,9 +6,29 @@ import bodyParser from 'body-parser';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DB_FILE = path.join(__dirname, 'database.json');
+
+// Helper DB
+const readDB = () => {
+    try {
+        if (!fs.existsSync(DB_FILE)) return { profile: {}, meals: [], onboarding: {} };
+        return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    } catch (e) {
+        return { profile: {}, meals: [], onboarding: {} };
+    }
+};
+
+const writeDB = (data) => {
+    try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+    } catch (e) {
+        console.error('Erro ao salvar DB:', e);
+    }
+};
 
 const app = express();
 app.use(cors());
@@ -16,6 +36,188 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(express.static(__dirname));
 
 const PORT = process.env.PORT || 3000;
+
+// --- ENDPOINTS DE PERSISTÊNCIA (Sync) ---
+
+// 1. Perfil
+app.get('/api/profile', (req, res) => {
+    const db = readDB();
+    res.json(db.profile || {});
+});
+
+app.post('/api/profile', (req, res) => {
+    const db = readDB();
+    db.profile = { ...db.profile, ...req.body };
+    writeDB(db);
+    res.json({ success: true, profile: db.profile });
+});
+
+// 2. Onboarding
+app.post('/api/onboarding', (req, res) => {
+    const db = readDB();
+    db.onboarding = req.body;
+    // Também atualiza perfil básico se disponível
+    if (req.body.data) {
+        const d = req.body.data;
+        db.profile = {
+            ...db.profile,
+            name: d.name || db.profile.name,
+            email: d.email || db.profile.email,
+            weight: d.weight || db.profile.weight,
+            height: d.height || db.profile.height,
+            age: d.age || db.profile.age,
+            gender: d.gender || db.profile.gender,
+            goal: d.goal || db.profile.goal
+        };
+    }
+    writeDB(db);
+    res.json({ success: true });
+});
+
+// 3. Refeições
+app.get('/api/meals', (req, res) => {
+    const db = readDB();
+    res.json(db.meals || []);
+});
+
+app.post('/api/meals', (req, res) => {
+    const db = readDB();
+    db.meals = db.meals || [];
+    
+    let meal;
+    if (req.body.id) {
+        const index = db.meals.findIndex(m => m.id === req.body.id);
+        if (index !== -1) {
+            // Update existing
+            db.meals[index] = { ...db.meals[index], ...req.body, timestamp: new Date().toISOString() };
+            meal = db.meals[index];
+        } else {
+            // Create new with provided ID (rare but possible if syncing)
+            meal = { ...req.body, timestamp: new Date().toISOString() };
+            db.meals.unshift(meal);
+        }
+    } else {
+        // Create new
+        meal = { id: Date.now().toString(), ...req.body, timestamp: new Date().toISOString() };
+        db.meals.unshift(meal);
+    }
+
+    // Manter apenas últimas 100
+    if (db.meals.length > 100) db.meals = db.meals.slice(0, 100);
+    writeDB(db);
+    res.json({ success: true, meal });
+});
+
+// 4. Check-ins
+app.get('/api/checkins', (req, res) => {
+    const db = readDB();
+    res.json(db.checkins || {});
+});
+
+app.post('/api/checkins', (req, res) => {
+    const db = readDB();
+    db.checkins = db.checkins || {};
+    // Merge new checkins with existing
+    db.checkins = { ...db.checkins, ...req.body };
+    writeDB(db);
+    res.json({ success: true });
+});
+
+// 5. Chat History
+app.get('/api/chat/history', (req, res) => {
+    const db = readDB();
+    res.json(db.chatHistory || []);
+});
+
+app.post('/api/chat/history', (req, res) => {
+    const db = readDB();
+    // Expects array of messages or single message? Let's say full array for simplicity or sync
+    // Or maybe append?
+    // Let's replace for now as client holds source of truth for session
+    db.chatHistory = req.body.messages || [];
+    writeDB(db);
+    res.json({ success: true });
+});
+
+// Endpoint para verificar status das chaves de API
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'online',
+        providers: {
+            gemini: !!process.env.GEMINI_API_KEY,
+            openai: !!process.env.OPENAI_API_KEY,
+            huggingface: !!process.env.HF_API_KEY
+        }
+    });
+});
+
+// Endpoint de Chat (Proxy para Gemini)
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { message, context, history } = req.body;
+        const apiKey = process.env.GEMINI_API_KEY;
+
+        if (!apiKey) {
+            return res.status(401).json({ error: 'Chave Gemini não configurada no servidor (.env)' });
+        }
+
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+        let chatHistory = [];
+
+        // System Prompt (Injected as context)
+        const systemPrompt = `
+You are the conversational engine of the app "Macro AI".
+You are connected to the internal user data system.
+
+USER DATA CONTEXT:
+${JSON.stringify(context || {}, null, 2)}
+
+Your job is to:
+1. Detect user intent.
+2. Fetch relevant internal data (provided above).
+3. Generate contextual, data-driven responses.
+4. Always prioritize user metrics before generic text.
+
+Rules:
+- If greeting: Respond with current contextual data summary.
+- If suggest diet: Use remaining macros and favorite foods.
+- If analyze: Generate consistency summary.
+- Tone: Human, Direct, Motivational, Data-driven. No robotic responses.
+- Language: Portuguese (Brazil).
+        `;
+
+        if (history && Array.isArray(history)) {
+             chatHistory = history.map(h => ({
+                 role: h.role === 'assistant' ? 'model' : 'user',
+                 parts: [{ text: h.text }]
+             }));
+        }
+
+        const chat = model.startChat({
+            history: [
+                { role: 'user', parts: [{ text: systemPrompt }] },
+                { role: 'model', parts: [{ text: "Entendido. Estou conectado aos dados do usuário e pronto para responder como Coach." }] },
+                ...chatHistory.slice(-10)
+            ],
+            generationConfig: {
+                maxOutputTokens: 500,
+                temperature: 0.7,
+            },
+        });
+
+        const result = await chat.sendMessage(message);
+        const response = result.response;
+        const text = response.text();
+
+        res.json({ text });
+
+    } catch (error) {
+        console.error('Chat Error:', error);
+        res.status(500).json({ error: 'Erro ao processar mensagem', details: error.message });
+    }
+});
 
 // Base de dados simples para fallback (Food101 labels -> Macros aproximados por 100g)
 const FOOD_DB = {
@@ -29,6 +231,52 @@ const FOOD_DB = {
     'chocolate_cake': { cal: 371, p: 5, c: 53, f: 15 },
     'default': { cal: 150, p: 10, c: 15, f: 5 }
 };
+
+app.get('/api/foods', (req, res) => {
+    res.json(FOOD_DB);
+});
+
+// Workouts Database
+const WORKOUTS_DB = {
+    'chest-triceps': {
+        title: 'Peito & Tríceps',
+        subtitle: '4 séries • 8-12 reps',
+        exercises: [
+            { name: 'Supino Reto', sets: 4, reps: '8-12', weight: 60, done: false },
+            { name: 'Supino Inclinado Halteres', sets: 3, reps: '10-12', weight: 24, done: false },
+            { name: 'Crucifixo Máquina', sets: 3, reps: '12-15', weight: 40, done: false },
+            { name: 'Tríceps Corda', sets: 4, reps: '12-15', weight: 20, done: false },
+            { name: 'Tríceps Francês', sets: 3, reps: '10-12', weight: 18, done: false }
+        ]
+    },
+    'back-biceps': {
+        title: 'Costas & Bíceps',
+        subtitle: '4 séries • 8-12 reps',
+        exercises: [
+            { name: 'Puxada Frente', sets: 4, reps: '8-12', weight: 50, done: false },
+            { name: 'Remada Curvada', sets: 4, reps: '8-10', weight: 60, done: false },
+            { name: 'Pulldown', sets: 3, reps: '12-15', weight: 25, done: false },
+            { name: 'Rosca Direta', sets: 4, reps: '10-12', weight: 15, done: false },
+            { name: 'Rosca Martelo', sets: 3, reps: '12', weight: 14, done: false }
+        ]
+    },
+    'legs-shoulders': {
+        title: 'Pernas & Ombros',
+        subtitle: '4 séries • 10-15 reps',
+        exercises: [
+            { name: 'Agachamento Livre', sets: 4, reps: '8-10', weight: 80, done: false },
+            { name: 'Leg Press 45', sets: 4, reps: '10-12', weight: 120, done: false },
+            { name: 'Cadeira Extensora', sets: 3, reps: '12-15', weight: 50, done: false },
+            { name: 'Desenvolvimento Militar', sets: 4, reps: '8-12', weight: 40, done: false },
+            { name: 'Elevação Lateral', sets: 3, reps: '15', weight: 12, done: false }
+        ]
+    }
+};
+
+app.get('/api/workouts', (req, res) => {
+    res.json(WORKOUTS_DB);
+});
+
 
 app.post('/api/analyze-image', async (req, res) => {
     try {
@@ -254,6 +502,31 @@ app.post('/api/analyze-image', async (req, res) => {
         console.error('Erro no proxy:', error);
         res.status(500).json({ error: error.message });
     }
+});
+
+// --- WORKOUT PROGRESS ENDPOINTS ---
+app.get('/api/workouts/progress', (req, res) => {
+    const db = readDB();
+    res.json(db.workoutProgress || {});
+});
+
+app.post('/api/workouts/progress', (req, res) => {
+    const db = readDB();
+    // Merge new progress with existing
+    // Structure: { "2023-10-27": { "chest-triceps": { "exercise-0": { sets: [...] } } } }
+    db.workoutProgress = db.workoutProgress || {};
+    
+    // Deep merge or just replace keys? 
+    // Since we likely send the whole day's progress or specific updates, let's merge at top level
+    Object.keys(req.body).forEach(date => {
+        db.workoutProgress[date] = { 
+            ...(db.workoutProgress[date] || {}), 
+            ...req.body[date] 
+        };
+    });
+    
+    writeDB(db);
+    res.json({ success: true });
 });
 
 // Exporta o app para Vercel (serverless)

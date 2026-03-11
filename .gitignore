@@ -6,3 +6,9 @@ dist/
 build/
 .vscode/
 .idea/
+diff.txt
+diff_utf8.txt
+fix.js
+fix2.js
+modified_index.html
+original_index.html
